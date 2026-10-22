@@ -1,0 +1,348 @@
+/**
+ * Unit tests for pi-serena detection logic.
+ */
+
+import { expect } from "chai";
+import { isReadOnlyWorkerAction, shouldRetryAfterTimeout } from "./index";
+import {
+  pathLooksLikeCode,
+  pathLooksNonSemantic,
+  commandLooksLikeSemanticCodeSearch,
+} from "./lib/detect";
+import { SERENA_FIRST_GUIDANCE, SERENA_MISS_GUIDANCE, isSerenaActive, shouldBlockSemanticMiss } from "./lib/guidance";
+import { normalizeTimeoutMs, stripControlParams } from "./lib/normalize";
+import { repairSymbolNameKey } from "./lib/symbol-key";
+import { truncateText, OUTPUT_MAX_LINES, OUTPUT_MAX_BYTES } from "./lib/truncate";
+
+describe("truncateText", () => {
+  it("passes short text through unchanged", () => {
+    expect(truncateText("short output")).to.equal("short output");
+  });
+
+  it("appends the marker when input exceeds the line cap", () => {
+    const text = Array.from({ length: OUTPUT_MAX_LINES + 1 }, (_, i) => `line ${i}`).join("\n");
+    const out = truncateText(text);
+    expect(out).to.include("[Serena output truncated to");
+    expect(out.split("\n").length).to.be.at.most(OUTPUT_MAX_LINES + 3);
+  });
+
+  it("appends the marker when input exceeds the byte cap, splitting on a multi-byte boundary without lone surrogates", () => {
+    // 3-byte chars: 51,200 % 3 ≠ 0, so the naive byte cut lands mid-character.
+    const text = Array.from({ length: OUTPUT_MAX_LINES + 500 }, () => "日".repeat(30)).join("\n");
+    const out = truncateText(text);
+    expect(out).to.include("[Serena output truncated to");
+    for (const ch of out) {
+      const cp = ch.codePointAt(0)!;
+      expect(cp).to.not.be.within(0xd800, 0xdfff);
+    }
+    expect(out).to.not.include("\uFFFD");
+  });
+});
+
+describe("Serena tool-selection guidance", () => {
+  it("uses procedural Serena-first wording", () => {
+    const guidance = SERENA_FIRST_GUIDANCE;
+    expect(guidance).to.include("before reading whole code files");
+    expect(guidance).to.include("serena_get_symbols_overview");
+    expect(guidance).to.include("serena_find_symbol");
+    expect(guidance).to.include("Use read/grep/find for docs, configs, non-code files");
+  });
+
+  it("detects strict-mode semantic misses for code reads and code searches", () => {
+    expect(shouldBlockSemanticMiss("read", { path: "src/index.ts" })).to.be.true;
+    expect(shouldBlockSemanticMiss("bash", { command: "rg 'class Foo' src/**/*.ts" })).to.be.true;
+  });
+
+  it("permits docs/config/non-code reads", () => {
+    expect(shouldBlockSemanticMiss("read", { path: "README.md" })).to.be.false;
+    expect(shouldBlockSemanticMiss("read", { path: "package.json" })).to.be.false;
+    expect(shouldBlockSemanticMiss("bash", { command: "rg 'install' README.md" })).to.be.false;
+  });
+
+  it("does not count --include/--exclude glob flags as searched code files", () => {
+    expect(commandLooksLikeSemanticCodeSearch('grep -rn "todo" --include="*.md" --include="*.ts" docs/')).to.be.false;
+    expect(commandLooksLikeSemanticCodeSearch("rg -g '*.ts' 'todo' docs/")).to.be.false;
+  });
+});
+
+describe("isSerenaActive", () => {
+  it("is true when the active tool list contains serena_find_symbol", () => {
+    expect(isSerenaActive(["read", "serena_find_symbol", "bash"])).to.be.true;
+  });
+
+  it("is false without serena_find_symbol in the list", () => {
+    expect(isSerenaActive(["read", "bash"])).to.be.false;
+    expect(isSerenaActive([])).to.be.false;
+  });
+
+  it("is false for undefined or non-array input", () => {
+    expect(isSerenaActive(undefined)).to.be.false;
+    expect(isSerenaActive("serena_find_symbol" as unknown as string[])).to.be.false;
+  });
+});
+
+describe("handler wiring", () => {
+  // Fake ExtensionAPI that records handlers; getActiveTools is the live registry
+  // the gates must read (regression: systemPromptOptions.selectedTools never
+  // contains extension-registered tools, so the guidance never fired).
+  function fakePi(activeTools: string[] | undefined) {
+    const handlers = new Map<string, Array<(event: any) => unknown>>();
+    const pi: any = {
+      on: (name: string, fn: (event: any) => unknown) => {
+        handlers.set(name, [...(handlers.get(name) ?? []), fn]);
+      },
+      registerTool: () => {},
+      registerCommand: () => {},
+      getActiveTools: () => activeTools,
+    };
+    const fire = async (name: string, event: any) => {
+      let out: unknown;
+      for (const fn of handlers.get(name) ?? []) out = await fn(event);
+      return out;
+    };
+    return { pi, fire };
+  }
+
+  it("before_agent_start appends guidance when serena tools are active", async () => {
+    const { pi, fire } = fakePi(["read", "serena_find_symbol", "bash"]);
+    const mod = await import("./index");
+    mod.default(pi);
+    const result = await fire("before_agent_start", { systemPrompt: "base" });
+    expect((result as any).systemPrompt).to.include(SERENA_FIRST_GUIDANCE);
+  });
+
+  it("before_agent_start does not append guidance without serena tools", async () => {
+    const { pi, fire } = fakePi(["read", "bash"]);
+    const mod = await import("./index");
+    mod.default(pi);
+    const result = await fire("before_agent_start", { systemPrompt: "base" });
+    expect(result).to.equal(undefined);
+  });
+});
+
+describe("repairSymbolNameKey", () => {
+  it("rewrites name_path -> name_path_pattern for pattern-key tools (find_symbol, safe_delete)", () => {
+    expect(repairSymbolNameKey({ name_path: "Foo", relative_path: "a.ts" }, true))
+      .to.deep.equal({ name_path_pattern: "Foo", relative_path: "a.ts" });
+  });
+
+  it("rewrites name_path_pattern -> name_path for the name_path tools", () => {
+    expect(repairSymbolNameKey({ name_path_pattern: "Foo", relative_path: "a.ts" }, false))
+      .to.deep.equal({ name_path: "Foo", relative_path: "a.ts" });
+  });
+
+  it("is a no-op when the expected key is already present", () => {
+    expect(repairSymbolNameKey({ name_path_pattern: "X" }, true)).to.deep.equal({ name_path_pattern: "X" });
+    expect(repairSymbolNameKey({ name_path: "X", relative_path: "." }, false)).to.deep.equal({ name_path: "X", relative_path: "." });
+  });
+
+  it("passes non-objects through unchanged", () => {
+    expect(repairSymbolNameKey(undefined, true)).to.equal(undefined);
+    expect(repairSymbolNameKey([1, 2], false)).to.deep.equal([1, 2]);
+  });
+});
+
+// ponytail: .spec.ts/.test.ts etc are covered by .ts — see pathLooksLikeCode uses lastIndexOf(".")
+describe("pathLooksLikeCode", () => {
+  const codeCases = [
+    ["src/index.ts", ".ts"],
+    ["src/main.py", ".py"],
+    ["src/main.go", ".go"],
+    ["src/app.js", ".js"],
+    ["src/Component.tsx", ".tsx"],
+    ["src/Component.jsx", ".jsx"],
+    ["src/Component.spec.ts", ".spec.ts (covered by .ts)"],
+    ["src/util.test.ts", ".test.ts (covered by .ts)"],
+    ["some-module.cjs", ".cjs"],
+  ];
+  for (const [path, label] of codeCases) {
+    it(`returns true for ${label}`, () => {
+      expect(pathLooksLikeCode(path)).to.be.true;
+    });
+  }
+
+  it("returns false for empty string", () => {
+    expect(pathLooksLikeCode("")).to.be.false;
+  });
+
+  it("returns false for non-string values", () => {
+    expect(pathLooksLikeCode(null)).to.be.false;
+    expect(pathLooksLikeCode(undefined)).to.be.false;
+    expect(pathLooksLikeCode(42)).to.be.false;
+  });
+
+  it("returns false for blank path", () => {
+    expect(pathLooksLikeCode("  ")).to.be.false;
+  });
+
+  it("ignores query strings", () => {
+    expect(pathLooksLikeCode("src/index.ts?foo=bar")).to.be.true;
+  });
+
+  it("ignores fragment identifiers", () => {
+    expect(pathLooksLikeCode("src/index.ts#L42")).to.be.true;
+  });
+});
+
+describe("pathLooksNonSemantic", () => {
+  const nonSemCases = [
+    ["README.md", ".md"],
+    ["package.json", ".json"],
+    [".serena/project.yml", ".yml"],
+    ["notes.txt", ".txt"],
+    ["data.csv", ".csv"],
+    ["server.log", ".log"],
+    [".env", ".env"],
+    ["config.toml", ".toml"],
+    [".editorconfig", ".editorconfig"],
+    [".gitignore", ".gitignore"],
+  ];
+  for (const [path, label] of nonSemCases) {
+    it(`returns true for ${label}`, () => {
+      expect(pathLooksNonSemantic(path)).to.be.true;
+    });
+  }
+
+  it("returns false for .ts source files", () => {
+    expect(pathLooksNonSemantic("src/index.ts")).to.be.false;
+  });
+
+  it("returns false for .py source files", () => {
+    expect(pathLooksNonSemantic("src/main.py")).to.be.false;
+  });
+});
+
+describe("commandLooksLikeSemanticCodeSearch", () => {
+  const trueCases = [
+    "grep -r 'class Foo' src/",
+    "rg 'function validate' src/",
+    "grep -rn 'def run' src/",
+    "rg 'references' src/ --type ts",
+    "find . -name '*.ts' | xargs grep 'interface'",
+    "rg 'doSomething' src/**/*.ts",
+    "grep 'error' *.py",
+  ];
+  for (const cmd of trueCases) {
+    it(`returns true for: ${cmd}`, () => {
+      expect(commandLooksLikeSemanticCodeSearch(cmd)).to.be.true;
+    });
+  }
+
+  const falseCases = [
+    ["ls -la", "no rg/grep/fd/find"],
+    ["cat file.ts", "no rg/grep/fd/find"],
+    ["node script.js", "no rg/grep/fd/find"],
+    ["rg 'TODO' AGENTS.md", "non-code target"],
+    ["grep 'version' package.json", "non-code target"],
+    ["grep 'description' SKILL.md", "non-code target"],
+    ["rg 'install' README.md", "non-code target"],
+    ["grep 'name' package.json", "non-code target"],
+    ["rg 'TODO' src/", "TODO pattern"],
+    ["grep -rn 'FIXME' src/", "TODO pattern"],
+    ["rg 'HACK' src/", "HACK pattern"],
+    ["grep 'NOTE' src/", "NOTE pattern"],
+    ["rg 'XXX' src/", "XXX pattern"],
+    ["grep -r 'BUG' src/", "BUG pattern"],
+    ["rg 'WORKAROUND' src/", "WORKAROUND pattern"],
+    ["rg 'TODO.*method' src/", "TODO still triggers exclusion"],
+  ];
+  for (const [cmd, label] of falseCases) {
+    it(`returns false for ${label}: ${cmd}`, () => {
+      expect(commandLooksLikeSemanticCodeSearch(cmd)).to.be.false;
+    });
+  }
+});
+
+describe("normalizeTimeoutMs", () => {
+  it("returns undefined for non-number non-string", () => {
+    expect(normalizeTimeoutMs(null)).to.be.undefined;
+    expect(normalizeTimeoutMs(undefined)).to.be.undefined;
+    expect(normalizeTimeoutMs(true)).to.be.undefined;
+    expect(normalizeTimeoutMs({})).to.be.undefined;
+  });
+
+  it("returns undefined for <= 0 numbers", () => {
+    expect(normalizeTimeoutMs(0)).to.be.undefined;
+    expect(normalizeTimeoutMs(-1)).to.be.undefined;
+  });
+
+  it("returns the number for positive finite numbers", () => {
+    expect(normalizeTimeoutMs(5000)).to.equal(5000);
+    expect(normalizeTimeoutMs(120000)).to.equal(120000);
+  });
+
+  it("parses numeric strings", () => {
+    expect(normalizeTimeoutMs("5000")).to.equal(5000);
+    expect(normalizeTimeoutMs("120000")).to.equal(120000);
+  });
+
+  it("returns undefined for non-numeric strings", () => {
+    expect(normalizeTimeoutMs("abc")).to.be.undefined;
+    expect(normalizeTimeoutMs("")).to.be.undefined;
+    expect(normalizeTimeoutMs("0")).to.be.undefined;
+    expect(normalizeTimeoutMs("-5")).to.be.undefined;
+  });
+
+  it("returns Infinity for Infinity", () => {
+    expect(normalizeTimeoutMs(Infinity)).to.be.undefined;
+  });
+});
+
+describe("stripControlParams", () => {
+  it("extracts control params and leaves tool params", () => {
+    const result = stripControlParams({ project: "/p", context: "c", timeout_ms: 5000, relative_path: "src/index.ts" });
+    expect(result).to.deep.equal({ project: "/p", context: "c", timeoutMs: 5000, params: { relative_path: "src/index.ts" } });
+  });
+
+  it("pattern is removed when renamed to substring_pattern", () => {
+    // This mirrors the search_for_pattern execute handler's mapping logic.
+    const params: Record<string, unknown> = { pattern: "foo", relative_path: "src/" };
+    if (params.pattern) {
+      params.substring_pattern = params.pattern;
+      delete params.pattern;
+    }
+    expect(params).to.have.property("substring_pattern", "foo");
+    expect(params).to.not.have.property("pattern");
+    expect(params).to.have.property("relative_path", "src/");
+  });
+});
+
+describe("read-only retry gate", () => {
+  it("classifies read-only actions and mutators", () => {
+    expect(isReadOnlyWorkerAction("call", { tool: "find_symbol" })).to.be.true;
+    expect(isReadOnlyWorkerAction("call", { tool: "get_symbols_overview" })).to.be.true;
+    expect(isReadOnlyWorkerAction("find_declaration")).to.be.true;
+    expect(isReadOnlyWorkerAction("get_diagnostics_for_file")).to.be.true;
+    expect(isReadOnlyWorkerAction("config")).to.be.true;
+    expect(isReadOnlyWorkerAction("status")).to.be.true;
+    expect(isReadOnlyWorkerAction("call", { tool: "replace_symbol_body" })).to.be.false;
+    expect(isReadOnlyWorkerAction("call", { tool: "insert_before_symbol" })).to.be.false;
+    expect(isReadOnlyWorkerAction("call", { tool: "rename_symbol" })).to.be.false;
+    expect(isReadOnlyWorkerAction("call", { tool: "safe_delete_symbol" })).to.be.false;
+    expect(isReadOnlyWorkerAction("call", { tool: "replace_content" })).to.be.false;
+    expect(isReadOnlyWorkerAction("restart_language_server")).to.be.false;
+    expect(isReadOnlyWorkerAction("onboarding")).to.be.false;
+  });
+
+  it("shouldRetryAfterTimeout: read-only tools retry on thrown timeout-class errors", () => {
+    expect(shouldRetryAfterTimeout("find_symbol", {}, { errorMessage: "Request timed out after 10ms" })).to.be.true;
+    expect(shouldRetryAfterTimeout("call", { tool: "get_symbols_overview" }, { errorMessage: "worker killed due to timeout" })).to.be.true;
+    // non-timeout errors never retry
+    expect(shouldRetryAfterTimeout("find_symbol", {}, { errorMessage: "unrelated failure" })).to.be.false;
+  });
+
+  it("shouldRetryAfterTimeout: mutators NEVER retry (may have applied before the kill)", () => {
+    expect(shouldRetryAfterTimeout("rename_symbol", {}, { errorMessage: "Request timed out after 10ms" })).to.be.false;
+    expect(shouldRetryAfterTimeout("call", { tool: "safe_delete_symbol" }, { errorMessage: "worker exited unexpectedly" })).to.be.false;
+    expect(shouldRetryAfterTimeout("replace_content", {}, { errorMessage: "Request timed out after 10ms" })).to.be.false;
+  });
+
+  it("shouldRetryAfterTimeout: thrown timeout-class errors retry only for read-only actions", () => {
+    for (const msg of ["Request timed out after 10ms", "worker killed due to timeout", "worker exited unexpectedly", "worker restarted"]) {
+      expect(shouldRetryAfterTimeout("search_for_pattern", {}, { errorMessage: msg }), msg).to.be.true;
+      expect(shouldRetryAfterTimeout("insert_before_symbol", {}, { errorMessage: msg }), msg).to.be.false;
+    }
+    expect(shouldRetryAfterTimeout("find_symbol", {}, { errorMessage: "unrelated failure" })).to.be.false;
+  });
+});
+

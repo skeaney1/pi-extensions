@@ -1,0 +1,9 @@
+spec:
+  - "index.test.ts"
+  - "worker.test.ts"
+  - "worker-diagnostics.test.ts"
+  - "env.test.ts"
+  - "deferred-tier.test.ts"
+require:
+  - tsx
+timeout: 10000
